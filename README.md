@@ -9,6 +9,9 @@
 - 后续自动读取本地缓存的用户名密码登录
 - 联系人可直接按用户名添加
 - 支持文字、表情、图片聊天
+- 支持消息状态：发送中、已送达、已读
+- 支持聊天图片点击全屏预览
+- 支持 PWA，可添加到手机桌面
 - 聊天内容在浏览器端加密，服务端只存密文
 
 ## 技术说明
@@ -72,6 +75,24 @@ PORT=3000 npm start
 docker build -t shytalk .
 docker run -d -p 3000:3000 -v $(pwd)/server/data:/app/server/data shytalk
 ```
+
+### 方式 3：一键脚本（Ubuntu + HTTPS 反代）
+
+仓库内置脚本会自动安装 Node.js 22、Caddy，并配置 systemd 与 HTTPS 反向代理：
+
+```bash
+sudo bash deploy/quick-deploy.sh your.domain.com https://github.com/cowbook/shytalk.git
+```
+
+部署后访问：`https://your.domain.com`
+
+## 自动构建
+
+项目已提供 GitHub Actions 工作流：
+
+- 文件：`.github/workflows/ci.yml`
+- 触发：push 到 `main` 或 pull request
+- 任务：安装依赖并执行 `npm run build`
 
 ## 安全边界
 

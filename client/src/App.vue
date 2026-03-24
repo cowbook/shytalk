@@ -4,6 +4,7 @@ import { api } from './lib/api'
 import { decryptChatPayload, decryptPrivateKey, encryptChatPayload, generateIdentity } from './lib/crypto'
 
 const STORAGE_KEY = 'shytalk.credentials'
+const STORAGE_OPTIONS_KEY = 'shytalk.chat.options'
 const IMAGE_SIZE_LIMIT = 2 * 1024 * 1024
 const emojiPanel = ['😀', '😂', '🥹', '❤️', '👍', '🔥', '🎉', '🌙']
 
@@ -24,6 +25,7 @@ const mobileTabs = [
   { key: 'chat', label: '聊天' },
   { key: 'profile', label: '我的' },
 ]
+const installPromptEvent = ref(null)
 
 const state = reactive({
   status: 'booting',
@@ -40,12 +42,16 @@ const state = reactive({
   socketState: 'offline',
   loadingMessages: false,
   sendingImage: false,
+  hideReadOnOpen: true,
+  previewImage: '',
+  clientCounter: 0,
 })
 
 const activeTitle = computed(() => state.activeContact?.username || '选择联系人')
 const showContactsPane = computed(() => !isMobile.value || mobilePane.value === 'contacts')
 const showChatPane = computed(() => !isMobile.value || mobilePane.value === 'chat')
 const showProfilePane = computed(() => isMobile.value && mobilePane.value === 'profile')
+const canInstallPwa = computed(() => Boolean(installPromptEvent.value))
 const activeSubtitle = computed(() => {
   if (!state.activeContact) {
     return '选择联系人后开始端到端加密聊天'
@@ -56,6 +62,31 @@ const activeSubtitle = computed(() => {
 const cacheStateText = computed(() => (state.currentUser ? '已保存在本机' : '等待登录'))
 const encryptionStateText = computed(() => (state.privateKey ? '本机私钥已解锁' : '尚未解锁'))
 const sessionStateText = computed(() => (state.socketState === 'online' ? '实时连接已建立' : '实时连接待恢复'))
+
+function loadChatOptions() {
+  const raw = localStorage.getItem(STORAGE_OPTIONS_KEY)
+
+  if (!raw) {
+    state.hideReadOnOpen = true
+    return
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    state.hideReadOnOpen = parsed.hideReadOnOpen !== false
+  } catch {
+    state.hideReadOnOpen = true
+  }
+}
+
+function saveChatOptions() {
+  localStorage.setItem(
+    STORAGE_OPTIONS_KEY,
+    JSON.stringify({
+      hideReadOnOpen: state.hideReadOnOpen,
+    })
+  )
+}
 
 function shortenPreview(text, maxLength = 22) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text
@@ -238,16 +269,19 @@ function decodeMessage(message, contact) {
     contact.publicKey,
     state.privateKey
   )
+  const outgoing = message.senderUsername === state.currentUser.username
 
   return {
     id: message.id,
     senderUsername: message.senderUsername,
     recipientUsername: message.recipientUsername,
-    outgoing: message.senderUsername === state.currentUser.username,
+    outgoing,
     kind: message.kind,
     text: payload.text || '',
     imageDataUrl: payload.imageDataUrl || '',
     createdAt: message.createdAt,
+    readAt: message.readAt || '',
+    status: outgoing ? (message.readAt ? 'read' : 'delivered') : '',
   }
 }
 
@@ -280,7 +314,8 @@ async function openConversation(contact) {
   setNotice('')
 
   try {
-    const payload = await api.get(`/api/messages/${encodeURIComponent(contact.username)}`, state.authToken)
+    const search = state.hideReadOnOpen ? '?hideRead=1' : ''
+    const payload = await api.get(`/api/messages/${encodeURIComponent(contact.username)}${search}`, state.authToken)
     state.messages = payload.messages.map((message) => decodeMessage(message, contact))
     updateContactEntry(contact.username, { unreadCount: 0 })
     scrollMessagesToBottom()
@@ -304,6 +339,55 @@ function touchContact(username) {
 
   const [contact] = state.contacts.splice(index, 1)
   state.contacts.unshift(contact)
+}
+
+function nextClientId() {
+  state.clientCounter += 1
+  return `${Date.now()}-${state.clientCounter}`
+}
+
+function appendLocalSendingMessage(contact, kind, payload, clientId) {
+  const now = new Date().toISOString()
+
+  const localMessage = {
+    id: `pending:${clientId}`,
+    senderUsername: state.currentUser.username,
+    recipientUsername: contact.username,
+    outgoing: true,
+    kind,
+    text: payload.text || '',
+    imageDataUrl: payload.imageDataUrl || '',
+    createdAt: now,
+    readAt: '',
+    status: 'sending',
+  }
+
+  state.messages.push(localMessage)
+
+  updateContactEntry(contact.username, {
+    lastMessageAt: now,
+    previewText: formatPreviewPayload(kind, payload, true),
+  })
+
+  scrollMessagesToBottom()
+}
+
+function hasMessageId(messageId) {
+  return state.messages.some((message) => String(message.id) === String(messageId))
+}
+
+function applyReadReceipt(contactUsername, readAt) {
+  for (const message of state.messages) {
+    if (
+      message.outgoing &&
+      message.recipientUsername === contactUsername &&
+      message.status !== 'sending' &&
+      !message.readAt
+    ) {
+      message.readAt = readAt
+      message.status = 'read'
+    }
+  }
 }
 
 async function finishAuth(sessionPayload, password, username) {
@@ -411,7 +495,7 @@ async function addContact() {
   }
 }
 
-function appendIncomingMessage(message) {
+function appendIncomingMessage(message, clientId = '') {
   const peerUsername = peerOfMessage(message)
 
   if (!peerUsername) {
@@ -436,19 +520,41 @@ function appendIncomingMessage(message) {
     previewText: buildPreviewFromEncryptedMessage(message, contact),
     unreadCount:
       message.senderUsername !== state.currentUser.username && state.activeContact?.username !== contact.username
-        ? (Number(contact.unreadCount || 0) + 1)
+        ? Number(contact.unreadCount || 0) + 1
         : 0,
   })
 
-  if (state.activeContact?.username !== contact.username) {
+  const isOutgoing = message.senderUsername === state.currentUser.username
+  const isActiveConversation = state.activeContact?.username === contact.username
+
+  if (!isActiveConversation) {
+    return
+  }
+
+  if (isOutgoing) {
+    const pendingId = `pending:${clientId}`
+    const pendingIndex = clientId ? state.messages.findIndex((item) => item.id === pendingId) : -1
+    const decoded = decodeMessage(message, contact)
+
+    if (pendingIndex >= 0) {
+      state.messages.splice(pendingIndex, 1, decoded)
+      scrollMessagesToBottom()
+      return
+    }
+
+    if (!hasMessageId(message.id)) {
+      state.messages.push(decoded)
+      scrollMessagesToBottom()
+    }
+
     return
   }
 
   try {
-    state.messages.push(decodeMessage(message, contact))
-    if (message.senderUsername !== state.currentUser.username) {
-      markConversationRead(contact.username).catch(() => {})
+    if (!hasMessageId(message.id)) {
+      state.messages.push(decodeMessage(message, contact))
     }
+    markConversationRead(contact.username).catch(() => {})
     scrollMessagesToBottom()
   } catch (error) {
     setError(error.message)
@@ -473,7 +579,14 @@ function connectSocket() {
     const payload = JSON.parse(event.data)
 
     if (payload.type === 'message_created') {
-      appendIncomingMessage(payload.message)
+      appendIncomingMessage(payload.message, payload.clientId || '')
+      return
+    }
+
+    if (payload.type === 'messages_read') {
+      if (payload.peerUsername === state.currentUser?.username) {
+        applyReadReceipt(payload.readerUsername, payload.readAt || new Date().toISOString())
+      }
       return
     }
 
@@ -504,13 +617,14 @@ function ensureSocketReady() {
   }
 }
 
-function sendCipherMessage(kind, encryptedPayload) {
+function sendCipherMessage(kind, encryptedPayload, clientId) {
   ensureSocketReady()
   state.socket.send(
     JSON.stringify({
       type: 'send_message',
       recipientUsername: state.activeContact.username,
       kind,
+      clientId,
       ...encryptedPayload,
     })
   )
@@ -523,16 +637,21 @@ function sendDraft() {
     return
   }
 
+  const clientId = nextClientId()
+
   try {
+    const plainPayload = {
+      text,
+    }
+    appendLocalSendingMessage(state.activeContact, 'text', plainPayload, clientId)
+
     const encryptedPayload = encryptChatPayload(
-      {
-        text,
-      },
+      plainPayload,
       state.activeContact.publicKey,
       state.privateKey
     )
 
-    sendCipherMessage('text', encryptedPayload)
+    sendCipherMessage('text', encryptedPayload, clientId)
     state.draft = ''
   } catch (error) {
     setError(error.message)
@@ -545,6 +664,14 @@ function appendEmoji(emoji) {
 
 function selectImage() {
   imagePicker.value?.click()
+}
+
+function openImagePreview(imageDataUrl) {
+  state.previewImage = imageDataUrl || ''
+}
+
+function closeImagePreview() {
+  state.previewImage = ''
 }
 
 function readFileAsDataUrl(file) {
@@ -570,18 +697,23 @@ async function handleImageSelect(event) {
   }
 
   state.sendingImage = true
+  const clientId = nextClientId()
 
   try {
     const imageDataUrl = await readFileAsDataUrl(file)
+    const plainPayload = {
+      imageDataUrl,
+    }
+
+    appendLocalSendingMessage(state.activeContact, 'image', plainPayload, clientId)
+
     const encryptedPayload = encryptChatPayload(
-      {
-        imageDataUrl,
-      },
+      plainPayload,
       state.activeContact.publicKey,
       state.privateKey
     )
 
-    sendCipherMessage('image', encryptedPayload)
+    sendCipherMessage('image', encryptedPayload, clientId)
   } catch (error) {
     setError(error.message)
   } finally {
@@ -589,9 +721,34 @@ async function handleImageSelect(event) {
   }
 }
 
+async function promptInstallPwa() {
+  if (!installPromptEvent.value) {
+    return
+  }
+
+  const promptEvent = installPromptEvent.value
+  installPromptEvent.value = null
+
+  await promptEvent.prompt()
+  await promptEvent.userChoice
+}
+
+function onBeforeInstallPrompt(event) {
+  event.preventDefault()
+  installPromptEvent.value = event
+}
+
+function onAppInstalled() {
+  installPromptEvent.value = null
+  setNotice('已安装到桌面')
+}
+
 onMounted(() => {
   syncViewportMode()
+  loadChatOptions()
   window.addEventListener('resize', syncViewportMode)
+  window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
+  window.addEventListener('appinstalled', onAppInstalled)
 
   bootstrap().catch(() => {
     state.status = 'auth'
@@ -601,6 +758,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', syncViewportMode)
+  window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
+  window.removeEventListener('appinstalled', onAppInstalled)
   state.socket?.close()
 })
 
@@ -617,6 +776,13 @@ watch(
   () => state.messages.length,
   () => {
     scrollMessagesToBottom()
+  }
+)
+
+watch(
+  () => state.hideReadOnOpen,
+  () => {
+    saveChatOptions()
   }
 )
 </script>
@@ -727,7 +893,13 @@ watch(
             </div>
           </div>
 
-          <p class="muted chat-header-note">{{ activeSubtitle }}</p>
+          <div class="chat-header-right">
+            <label class="read-toggle">
+              <input v-model="state.hideReadOnOpen" type="checkbox" />
+              <span>[] 自动清除</span>
+            </label>
+            <p class="muted chat-header-note">{{ activeSubtitle }}</p>
+          </div>
         </header>
 
         <div v-if="!state.activeContact" class="chat-empty">
@@ -749,8 +921,19 @@ watch(
             >
               <div class="message-bubble">
                 <p v-if="message.kind === 'text'">{{ message.text }}</p>
-                <img v-else :src="message.imageDataUrl" alt="聊天图片" class="message-image" />
-                <span>{{ formatClock(message.createdAt) }}</span>
+                <img
+                  v-else
+                  :src="message.imageDataUrl"
+                  alt="聊天图片"
+                  class="message-image"
+                  @click="openImagePreview(message.imageDataUrl)"
+                />
+                <div class="message-meta">
+                  <span>{{ formatClock(message.createdAt) }}</span>
+                  <strong v-if="message.outgoing" class="message-state">
+                    {{ message.status === 'sending' ? '发送中' : message.status === 'read' ? '已读' : '已送达' }}
+                  </strong>
+                </div>
               </div>
             </article>
           </div>
@@ -828,6 +1011,13 @@ watch(
             <span>连接恢复后会继续使用当前身份收发消息。</span>
           </article>
 
+          <article class="profile-card">
+            <p class="eyebrow">安装到桌面</p>
+            <strong>{{ canInstallPwa ? '可安装' : '已安装或当前设备不支持' }}</strong>
+            <button v-if="canInstallPwa" type="button" class="ghost-button" @click="promptInstallPwa">添加到手机桌面</button>
+            <span v-else>在支持的浏览器中会自动出现安装入口。</span>
+          </article>
+
           <article class="profile-card wide-card">
             <p class="eyebrow">当前会话</p>
             <strong>{{ state.activeContact?.username || '还没有选择联系人' }}</strong>
@@ -851,5 +1041,10 @@ watch(
         </button>
       </nav>
     </main>
+
+    <div v-if="state.previewImage" class="image-lightbox" @click="closeImagePreview">
+      <img :src="state.previewImage" alt="全屏预览" class="lightbox-image" />
+      <button type="button" class="lightbox-close">关闭</button>
+    </div>
   </div>
 </template>

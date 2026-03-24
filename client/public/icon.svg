@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ShyTalk">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c75b32" />
+      <stop offset="1" stop-color="#8f3310" />
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#bg)" />
+  <path d="M118 132h276a42 42 0 0 1 42 42v142a42 42 0 0 1-42 42H246l-88 72v-72h-40a42 42 0 0 1-42-42V174a42 42 0 0 1 42-42Z" fill="#fff5ec" opacity="0.95"/>
+  <circle cx="196" cy="246" r="22" fill="#8f3310"/>
+  <circle cx="256" cy="246" r="22" fill="#8f3310"/>
+  <circle cx="316" cy="246" r="22" fill="#8f3310"/>
+</svg>

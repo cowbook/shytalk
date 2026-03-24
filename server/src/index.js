@@ -143,6 +143,10 @@ function markConversationRead(userId, otherUserId) {
     .run(otherUserId, userId)
 }
 
+function parseBooleanFlag(value) {
+  return value === '1' || value === 'true' || value === 'yes'
+}
+
 function listContacts(userId) {
   return db
     .prepare(
@@ -185,7 +189,9 @@ function listContacts(userId) {
     .all(userId, userId)
 }
 
-function conversationMessages(userId, otherUserId) {
+function conversationMessages(userId, otherUserId, options = {}) {
+  const hideRead = Boolean(options.hideRead)
+
   return db
     .prepare(
       `
@@ -194,6 +200,7 @@ function conversationMessages(userId, otherUserId) {
           m.kind,
           m.body_cipher AS bodyCipher,
           m.nonce,
+          m.read_at AS readAt,
           m.created_at AS createdAt,
           sender.username AS senderUsername,
           recipient.username AS recipientUsername
@@ -201,14 +208,22 @@ function conversationMessages(userId, otherUserId) {
         JOIN users sender ON sender.id = m.sender_id
         JOIN users recipient ON recipient.id = m.recipient_id
         WHERE
-          (m.sender_id = ? AND m.recipient_id = ?)
-          OR
-          (m.sender_id = ? AND m.recipient_id = ?)
+          (
+            (m.sender_id = ? AND m.recipient_id = ?)
+            OR
+            (m.sender_id = ? AND m.recipient_id = ?)
+          )
+          AND
+          (
+            ? = 0
+            OR
+            NOT (m.recipient_id = ? AND m.read_at IS NOT NULL)
+          )
         ORDER BY datetime(m.created_at) ASC, m.id ASC
         LIMIT 500
       `
     )
-    .all(userId, otherUserId, otherUserId, userId)
+    .all(userId, otherUserId, otherUserId, userId, hideRead ? 1 : 0, userId)
 }
 
 function broadcastTo(userId, payload) {
@@ -333,9 +348,21 @@ app.get('/api/messages/:username', authMiddleware, (req, res) => {
   }
 
   ensureMutualContact(req.user.id, other.id)
-  markConversationRead(req.user.id, other.id)
+  const hideRead = parseBooleanFlag(req.query.hideRead)
+  const messages = conversationMessages(req.user.id, other.id, { hideRead })
+  const result = markConversationRead(req.user.id, other.id)
+
+  if (result.changes > 0) {
+    broadcastTo(other.id, {
+      type: 'messages_read',
+      readerUsername: req.user.username,
+      peerUsername: other.username,
+      readAt: new Date().toISOString(),
+    })
+  }
+
   res.json({
-    messages: conversationMessages(req.user.id, other.id),
+    messages,
   })
 })
 
@@ -349,6 +376,16 @@ app.post('/api/messages/:username/read', authMiddleware, (req, res) => {
 
   ensureMutualContact(req.user.id, other.id)
   const result = markConversationRead(req.user.id, other.id)
+
+  if (result.changes > 0) {
+    broadcastTo(other.id, {
+      type: 'messages_read',
+      readerUsername: req.user.username,
+      peerUsername: other.username,
+      readAt: new Date().toISOString(),
+    })
+  }
+
   res.json({ updatedCount: result.changes })
 })
 
@@ -401,6 +438,7 @@ wss.on('connection', (socket, req) => {
       const kind = payload.kind === 'image' ? 'image' : 'text'
       const bodyCipher = String(payload.bodyCipher || '')
       const nonce = String(payload.nonce || '')
+      const clientId = String(payload.clientId || '').trim()
 
       if (!recipientUsername || !bodyCipher || !nonce) {
         socket.send(JSON.stringify({ type: 'error', error: '消息内容不完整' }))
@@ -438,6 +476,7 @@ wss.on('connection', (socket, req) => {
               m.kind,
               m.body_cipher AS bodyCipher,
               m.nonce,
+              m.read_at AS readAt,
               m.created_at AS createdAt,
               sender.username AS senderUsername,
               recipient.username AS recipientUsername
@@ -452,6 +491,7 @@ wss.on('connection', (socket, req) => {
       const responsePayload = {
         type: 'message_created',
         message,
+        clientId,
       }
 
       broadcastTo(user.id, responsePayload)
