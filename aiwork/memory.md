@@ -14,3 +14,11 @@
 - Added PWA support (manifest + service worker + install prompt) for add-to-home-screen on mobile.
 - Added GitHub Actions CI workflow for automatic build checks.
 - Added one-click Ubuntu deployment script with Caddy HTTPS reverse proxy.
+
+## 2026-03-25
+- Added user profile fields and migrations: nickname, avatar_url, gender, bio.
+- Added 10 preset cute avatar options and auto-assigned a random avatar at registration.
+- Added profile APIs to fetch and update nickname/avatar/gender/bio with validation.
+- Included avatar and nickname in user/contact payloads for frontend display.
+- Updated mobile UI to show avatars in sidebar and contact list.
+- Added profile editor with avatar picker, gender selector, nickname, and bio editing.

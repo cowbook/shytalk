@@ -14,6 +14,19 @@ const sessions = new Map()
 const sockets = new Map()
 
 const usernamePattern = /^[\p{L}\p{N}_-]{2,20}$/u
+const PROFILE_GENDERS = new Set(['unknown', 'male', 'female', 'other'])
+const AVATAR_OPTIONS = [
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=MochiBear',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=PeachBunny',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=MintKitty',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=CloudPuff',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=TinyPanda',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=BerryFox',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=SugarDuck',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=SunnyKoala',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=LemonOtter',
+  'https://api.dicebear.com/9.x/lorelei/svg?seed=CocoaSeal',
+]
 
 const app = express()
 app.use(express.json({ limit: '8mb' }))
@@ -66,10 +79,50 @@ function publicUser(row) {
   return {
     id: row.id,
     username: row.username,
+    nickname: row.nickname || row.username,
+    avatarUrl: row.avatar_url || '',
+    gender: row.gender || 'unknown',
+    bio: row.bio || '',
     publicKey: row.public_key,
     encryptedPrivateKey: row.encrypted_private_key,
     keySalt: row.key_salt,
     createdAt: row.created_at,
+  }
+}
+
+function pickRandomAvatar() {
+  return AVATAR_OPTIONS[Math.floor(Math.random() * AVATAR_OPTIONS.length)]
+}
+
+function validateProfilePayload({ nickname, avatarUrl, gender, bio }) {
+  const normalizedNickname = String(nickname || '').trim()
+  const normalizedAvatarUrl = String(avatarUrl || '').trim()
+  const normalizedGender = String(gender || 'unknown').trim().toLowerCase()
+  const normalizedBio = String(bio || '').trim()
+
+  if (!normalizedNickname || normalizedNickname.length > 24) {
+    return { error: '昵称不能为空且不超过 24 个字符' }
+  }
+
+  if (!AVATAR_OPTIONS.includes(normalizedAvatarUrl)) {
+    return { error: '头像不在可选列表中' }
+  }
+
+  if (!PROFILE_GENDERS.has(normalizedGender)) {
+    return { error: '性别值不合法' }
+  }
+
+  if (normalizedBio.length > 140) {
+    return { error: '说明不超过 140 个字符' }
+  }
+
+  return {
+    value: {
+      nickname: normalizedNickname,
+      avatarUrl: normalizedAvatarUrl,
+      gender: normalizedGender,
+      bio: normalizedBio,
+    },
   }
 }
 
@@ -154,6 +207,8 @@ function listContacts(userId) {
         SELECT
           u.id,
           u.username,
+          u.nickname AS nickname,
+          u.avatar_url AS avatarUrl,
           u.public_key AS publicKey,
           COALESCE(lastMessage.created_at, c.created_at) AS lastMessageAt,
           lastMessage.kind AS lastMessageKind,
@@ -268,19 +323,34 @@ app.post('/api/auth/register', (req, res) => {
       `
         INSERT INTO users (
           username,
+          nickname,
+          avatar_url,
+          gender,
+          bio,
           password_hash,
           password_salt,
           public_key,
           encrypted_private_key,
           key_salt
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
-    .run(username, passwordHash, salt, publicKey, encryptedPrivateKey, keySalt)
+    .run(
+      username,
+      username,
+      pickRandomAvatar(),
+      'unknown',
+      '',
+      passwordHash,
+      salt,
+      publicKey,
+      encryptedPrivateKey,
+      keySalt
+    )
 
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid)
   const token = issueSession(user.id)
-  res.json({ token, user: publicUser(user) })
+  res.json({ token, user: publicUser(user), avatarOptions: AVATAR_OPTIONS })
 })
 
 app.post('/api/auth/login', (req, res) => {
@@ -305,7 +375,7 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   const token = issueSession(user.id)
-  res.json({ token, user: publicUser(user) })
+  res.json({ token, user: publicUser(user), avatarOptions: AVATAR_OPTIONS })
 })
 
 app.get('/api/contacts', authMiddleware, (req, res) => {
@@ -336,7 +406,49 @@ app.post('/api/contacts', authMiddleware, (req, res) => {
 
   ensureMutualContact(req.user.id, contact.id)
   broadcastTo(contact.id, { type: 'contact_refresh' })
-  res.json({ message: '联系人已添加', contact: { username: contact.username, publicKey: contact.public_key } })
+  res.json({
+    message: '联系人已添加',
+    contact: {
+      username: contact.username,
+      nickname: contact.nickname || contact.username,
+      avatarUrl: contact.avatar_url || '',
+      publicKey: contact.public_key,
+    },
+  })
+})
+
+app.get('/api/profile', authMiddleware, (req, res) => {
+  res.json({
+    user: publicUser(req.user),
+    avatarOptions: AVATAR_OPTIONS,
+  })
+})
+
+app.post('/api/profile', authMiddleware, (req, res) => {
+  const validation = validateProfilePayload(req.body || {})
+
+  if (validation.error) {
+    res.status(400).json({ error: validation.error })
+    return
+  }
+
+  const { nickname, avatarUrl, gender, bio } = validation.value
+
+  db.prepare(
+    `
+      UPDATE users
+      SET nickname = ?, avatar_url = ?, gender = ?, bio = ?
+      WHERE id = ?
+    `
+  ).run(nickname, avatarUrl, gender, bio, req.user.id)
+
+  const updatedUser = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id)
+
+  res.json({
+    message: '资料已更新',
+    user: publicUser(updatedUser),
+    avatarOptions: AVATAR_OPTIONS,
+  })
 })
 
 app.get('/api/messages/:username', authMiddleware, (req, res) => {

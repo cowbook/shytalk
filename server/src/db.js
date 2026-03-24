@@ -51,3 +51,30 @@ const messageColumns = db.prepare('PRAGMA table_info(messages)').all()
 if (!messageColumns.some((column) => column.name === 'read_at')) {
   db.exec('ALTER TABLE messages ADD COLUMN read_at TEXT')
 }
+
+const userColumns = db.prepare('PRAGMA table_info(users)').all()
+
+if (!userColumns.some((column) => column.name === 'nickname')) {
+  db.exec('ALTER TABLE users ADD COLUMN nickname TEXT')
+}
+
+if (!userColumns.some((column) => column.name === 'avatar_url')) {
+  db.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT')
+}
+
+if (!userColumns.some((column) => column.name === 'gender')) {
+  db.exec('ALTER TABLE users ADD COLUMN gender TEXT')
+}
+
+if (!userColumns.some((column) => column.name === 'bio')) {
+  db.exec('ALTER TABLE users ADD COLUMN bio TEXT')
+}
+
+db.exec(`
+  UPDATE users
+  SET
+    nickname = COALESCE(NULLIF(TRIM(nickname), ''), username),
+    avatar_url = COALESCE(NULLIF(TRIM(avatar_url), ''), ''),
+    gender = COALESCE(NULLIF(TRIM(gender), ''), 'unknown'),
+    bio = COALESCE(bio, '')
+`)

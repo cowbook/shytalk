@@ -44,6 +44,16 @@ textarea {
   font: inherit;
 }
 
+select {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(90, 57, 27, 0.12);
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--ink);
+  outline: none;
+}
+
 button {
   border: 0;
   cursor: pointer;
@@ -242,6 +252,30 @@ textarea:focus {
   gap: 12px;
 }
 
+.sidebar-user,
+.profile-title {
+  display: grid;
+  gap: 4px;
+}
+
+.username-tag {
+  font-size: 12px;
+}
+
+.avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.74);
+}
+
+.avatar-lg {
+  width: 56px;
+  height: 56px;
+  border-radius: 16px;
+}
+
 .status-pill {
   padding: 8px 12px;
   border-radius: 999px;
@@ -416,6 +450,35 @@ textarea:focus {
   border-radius: 22px;
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.58);
+}
+
+.profile-label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.profile-select {
+  margin-top: 2px;
+}
+
+.avatar-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.avatar-pick {
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.avatar-pick.active {
+  border-color: rgba(199, 91, 50, 0.6);
+  box-shadow: 0 0 0 3px rgba(199, 91, 50, 0.16);
 }
 
 .profile-card strong {

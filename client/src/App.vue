@@ -7,6 +7,12 @@ const STORAGE_KEY = 'shytalk.credentials'
 const STORAGE_OPTIONS_KEY = 'shytalk.chat.options'
 const IMAGE_SIZE_LIMIT = 2 * 1024 * 1024
 const emojiPanel = ['😀', '😂', '🥹', '❤️', '👍', '🔥', '🎉', '🌙']
+const GENDER_OPTIONS = [
+  { value: 'unknown', label: '保密' },
+  { value: 'male', label: '男' },
+  { value: 'female', label: '女' },
+  { value: 'other', label: '其他' },
+]
 
 const authMode = ref('login')
 const authForm = reactive({
@@ -15,6 +21,12 @@ const authForm = reactive({
 })
 const contactForm = reactive({
   username: '',
+})
+const profileForm = reactive({
+  nickname: '',
+  avatarUrl: '',
+  gender: 'unknown',
+  bio: '',
 })
 const imagePicker = ref(null)
 const messagesContainer = ref(null)
@@ -45,6 +57,8 @@ const state = reactive({
   hideReadOnOpen: true,
   previewImage: '',
   clientCounter: 0,
+  avatarOptions: [],
+  savingProfile: false,
 })
 
 const activeTitle = computed(() => state.activeContact?.username || '选择联系人')
@@ -52,6 +66,7 @@ const showContactsPane = computed(() => !isMobile.value || mobilePane.value === 
 const showChatPane = computed(() => !isMobile.value || mobilePane.value === 'chat')
 const showProfilePane = computed(() => isMobile.value && mobilePane.value === 'profile')
 const canInstallPwa = computed(() => Boolean(installPromptEvent.value))
+const currentDisplayName = computed(() => state.currentUser?.nickname || state.currentUser?.username || '')
 const activeSubtitle = computed(() => {
   if (!state.activeContact) {
     return '选择联系人后开始端到端加密聊天'
@@ -62,6 +77,17 @@ const activeSubtitle = computed(() => {
 const cacheStateText = computed(() => (state.currentUser ? '已保存在本机' : '等待登录'))
 const encryptionStateText = computed(() => (state.privateKey ? '本机私钥已解锁' : '尚未解锁'))
 const sessionStateText = computed(() => (state.socketState === 'online' ? '实时连接已建立' : '实时连接待恢复'))
+
+function contactDisplayName(contact) {
+  return contact?.nickname || contact?.username || ''
+}
+
+function syncProfileFormFromCurrentUser() {
+  profileForm.nickname = state.currentUser?.nickname || state.currentUser?.username || ''
+  profileForm.avatarUrl = state.currentUser?.avatarUrl || state.avatarOptions[0] || ''
+  profileForm.gender = state.currentUser?.gender || 'unknown'
+  profileForm.bio = state.currentUser?.bio || ''
+}
 
 function loadChatOptions() {
   const raw = localStorage.getItem(STORAGE_OPTIONS_KEY)
@@ -133,6 +159,8 @@ function buildPreviewFromEncryptedMessage(message, contact) {
 function normalizeContact(contact) {
   return {
     ...contact,
+    nickname: contact.nickname || contact.username,
+    avatarUrl: contact.avatarUrl || '',
     unreadCount: Number(contact.unreadCount || 0),
     previewText: contact.lastMessageAt
       ? buildPreviewFromEncryptedMessage(
@@ -393,17 +421,49 @@ function applyReadReceipt(contactUsername, readAt) {
 async function finishAuth(sessionPayload, password, username) {
   state.authToken = sessionPayload.token
   state.currentUser = sessionPayload.user
+  state.avatarOptions = sessionPayload.avatarOptions || state.avatarOptions
   state.privateKey = await decryptPrivateKey(
     password,
     sessionPayload.user.keySalt,
     sessionPayload.user.encryptedPrivateKey
   )
+  syncProfileFormFromCurrentUser()
   storeCredentials(username, password)
   state.status = 'ready'
   mobilePane.value = isMobile.value && !state.activeContact ? 'contacts' : 'chat'
   setNotice('已连接')
   await loadContacts()
   connectSocket()
+}
+
+async function saveProfile() {
+  if (!state.authToken) {
+    return
+  }
+
+  state.savingProfile = true
+
+  try {
+    const payload = await api.post(
+      '/api/profile',
+      {
+        nickname: profileForm.nickname.trim(),
+        avatarUrl: profileForm.avatarUrl,
+        gender: profileForm.gender,
+        bio: profileForm.bio,
+      },
+      state.authToken
+    )
+
+    state.currentUser = payload.user
+    state.avatarOptions = payload.avatarOptions || state.avatarOptions
+    syncProfileFormFromCurrentUser()
+    setNotice(payload.message || '资料已更新')
+  } catch (error) {
+    setError(error.message)
+  } finally {
+    state.savingProfile = false
+  }
 }
 
 async function submitAuth() {
@@ -830,9 +890,11 @@ watch(
     <main v-else class="app-frame">
       <aside v-if="showContactsPane" class="sidebar" :class="{ 'mobile-pane': isMobile }">
         <div class="sidebar-header">
-          <div>
+          <div class="sidebar-user">
+            <img v-if="state.currentUser?.avatarUrl" :src="state.currentUser.avatarUrl" alt="我的头像" class="avatar avatar-lg" />
             <p class="eyebrow">在线身份</p>
-            <h2>{{ state.currentUser?.username }}</h2>
+            <h2>{{ currentDisplayName }}</h2>
+            <p class="muted username-tag">@{{ state.currentUser?.username }}</p>
           </div>
 
           <span class="status-pill" :class="state.socketState">{{ state.socketState }}</span>
@@ -863,8 +925,9 @@ watch(
             :class="{ active: state.activeContact?.username === contact.username }"
             @click="openConversation(contact)"
           >
+            <img v-if="contact.avatarUrl" :src="contact.avatarUrl" alt="联系人头像" class="avatar" />
             <div class="contact-copy">
-              <strong>{{ contact.username }}</strong>
+              <strong>{{ contactDisplayName(contact) }}</strong>
               <p class="contact-preview">{{ contact.previewText }}</p>
             </div>
 
@@ -978,9 +1041,11 @@ watch(
 
       <section v-if="showProfilePane" class="profile-panel mobile-pane">
         <header class="profile-header">
-          <div>
+          <div class="profile-title">
+            <img v-if="profileForm.avatarUrl" :src="profileForm.avatarUrl" alt="头像预览" class="avatar avatar-lg" />
             <p class="eyebrow">我的</p>
-            <h2>{{ state.currentUser?.username }}</h2>
+            <h2>{{ currentDisplayName }}</h2>
+            <p class="muted username-tag">@{{ state.currentUser?.username }}</p>
           </div>
 
           <span class="status-pill" :class="state.socketState">{{ state.socketState }}</span>
@@ -988,9 +1053,44 @@ watch(
 
         <div class="profile-grid">
           <article class="profile-card accent-card">
-            <p class="eyebrow">身份摘要</p>
-            <strong>{{ state.currentUser?.username }}</strong>
-            <span>这是别人添加你时使用的用户名。</span>
+            <p class="eyebrow">资料编辑</p>
+
+            <label class="profile-label">
+              <span>昵称</span>
+              <input v-model="profileForm.nickname" maxlength="24" placeholder="输入你的昵称" />
+            </label>
+
+            <label class="profile-label">
+              <span>性别</span>
+              <select v-model="profileForm.gender" class="profile-select">
+                <option v-for="item in GENDER_OPTIONS" :key="item.value" :value="item.value">{{ item.label }}</option>
+              </select>
+            </label>
+
+            <label class="profile-label">
+              <span>说明</span>
+              <textarea v-model="profileForm.bio" rows="3" maxlength="140" placeholder="一句话介绍自己"></textarea>
+            </label>
+
+            <button type="button" class="primary-button" :disabled="state.savingProfile" @click="saveProfile">
+              {{ state.savingProfile ? '保存中...' : '保存资料' }}
+            </button>
+          </article>
+
+          <article class="profile-card">
+            <p class="eyebrow">萌萌头像（10选1）</p>
+            <div class="avatar-grid">
+              <button
+                v-for="avatar in state.avatarOptions"
+                :key="avatar"
+                type="button"
+                class="avatar-pick"
+                :class="{ active: profileForm.avatarUrl === avatar }"
+                @click="profileForm.avatarUrl = avatar"
+              >
+                <img :src="avatar" alt="可选头像" class="avatar" />
+              </button>
+            </div>
           </article>
 
           <article class="profile-card">
