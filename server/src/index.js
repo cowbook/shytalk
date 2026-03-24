@@ -1,0 +1,477 @@
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import express from 'express'
+import { WebSocketServer } from 'ws'
+import { db } from './db.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const clientDist = path.resolve(__dirname, '../../client/dist')
+const port = Number(process.env.PORT || 3000)
+const sessions = new Map()
+const sockets = new Map()
+
+const usernamePattern = /^[\p{L}\p{N}_-]{2,20}$/u
+
+const app = express()
+app.use(express.json({ limit: '8mb' }))
+
+function nowPlusDays(days) {
+  return Date.now() + days * 24 * 60 * 60 * 1000
+}
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString('base64')
+}
+
+function makeSalt(bytes = 16) {
+  return crypto.randomBytes(bytes).toString('base64')
+}
+
+function issueSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex')
+  sessions.set(token, {
+    userId,
+    expiresAt: nowPlusDays(7),
+  })
+  return token
+}
+
+function findSession(token) {
+  const session = sessions.get(token)
+
+  if (!session) {
+    return null
+  }
+
+  if (session.expiresAt <= Date.now()) {
+    sessions.delete(token)
+    return null
+  }
+
+  return session
+}
+
+setInterval(() => {
+  for (const [token, session] of sessions.entries()) {
+    if (session.expiresAt <= Date.now()) {
+      sessions.delete(token)
+    }
+  }
+}, 60_000).unref()
+
+function publicUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    publicKey: row.public_key,
+    encryptedPrivateKey: row.encrypted_private_key,
+    keySalt: row.key_salt,
+    createdAt: row.created_at,
+  }
+}
+
+function parseBearerToken(req) {
+  const header = req.headers.authorization || ''
+  if (!header.startsWith('Bearer ')) {
+    return null
+  }
+
+  return header.slice(7)
+}
+
+function authMiddleware(req, res, next) {
+  const token = parseBearerToken(req)
+  const session = token ? findSession(token) : null
+
+  if (!session) {
+    res.status(401).json({ error: '登录已失效，请重新登录' })
+    return
+  }
+
+  const user = db
+    .prepare('SELECT * FROM users WHERE id = ?')
+    .get(session.userId)
+
+  if (!user) {
+    res.status(401).json({ error: '用户不存在' })
+    return
+  }
+
+  req.user = user
+  next()
+}
+
+function validateAuthPayload({ username, password, publicKey, encryptedPrivateKey, keySalt }, requireKeys) {
+  if (!usernamePattern.test(username || '')) {
+    return '用户名需为 2-20 位，可使用中文、字母、数字、下划线或短横线'
+  }
+
+  if (!password || password.length < 6 || password.length > 64) {
+    return '密码长度需在 6 到 64 位之间'
+  }
+
+  if (requireKeys && (!publicKey || !encryptedPrivateKey || !keySalt)) {
+    return '缺少密钥信息'
+  }
+
+  return null
+}
+
+function ensureMutualContact(userId, contactId) {
+  const stmt = db.prepare(
+    'INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)' 
+  )
+  const transaction = db.transaction(() => {
+    stmt.run(userId, contactId)
+    stmt.run(contactId, userId)
+  })
+  transaction()
+}
+
+function markConversationRead(userId, otherUserId) {
+  return db
+    .prepare(
+      `
+        UPDATE messages
+        SET read_at = CURRENT_TIMESTAMP
+        WHERE sender_id = ? AND recipient_id = ? AND read_at IS NULL
+      `
+    )
+    .run(otherUserId, userId)
+}
+
+function listContacts(userId) {
+  return db
+    .prepare(
+      `
+        SELECT
+          u.id,
+          u.username,
+          u.public_key AS publicKey,
+          COALESCE(lastMessage.created_at, c.created_at) AS lastMessageAt,
+          lastMessage.kind AS lastMessageKind,
+          lastMessage.body_cipher AS lastMessageBodyCipher,
+          lastMessage.nonce AS lastMessageNonce,
+          lastSender.username AS lastMessageSenderUsername,
+          lastRecipient.username AS lastMessageRecipientUsername,
+          COALESCE(unread.unreadCount, 0) AS unreadCount
+        FROM contacts c
+        JOIN users u ON u.id = c.contact_id
+        LEFT JOIN messages lastMessage ON lastMessage.id = (
+          SELECT m.id
+          FROM messages m
+          WHERE
+            (m.sender_id = c.user_id AND m.recipient_id = c.contact_id)
+            OR
+            (m.sender_id = c.contact_id AND m.recipient_id = c.user_id)
+          ORDER BY datetime(m.created_at) DESC, m.id DESC
+          LIMIT 1
+        )
+        LEFT JOIN users lastSender ON lastSender.id = lastMessage.sender_id
+        LEFT JOIN users lastRecipient ON lastRecipient.id = lastMessage.recipient_id
+        LEFT JOIN (
+          SELECT sender_id, recipient_id, COUNT(*) AS unreadCount
+          FROM messages
+          WHERE recipient_id = ? AND read_at IS NULL
+          GROUP BY sender_id, recipient_id
+        ) unread ON unread.sender_id = c.contact_id AND unread.recipient_id = c.user_id
+        WHERE c.user_id = ?
+        ORDER BY datetime(lastMessageAt) DESC, u.username ASC
+      `
+    )
+    .all(userId, userId)
+}
+
+function conversationMessages(userId, otherUserId) {
+  return db
+    .prepare(
+      `
+        SELECT
+          m.id,
+          m.kind,
+          m.body_cipher AS bodyCipher,
+          m.nonce,
+          m.created_at AS createdAt,
+          sender.username AS senderUsername,
+          recipient.username AS recipientUsername
+        FROM messages m
+        JOIN users sender ON sender.id = m.sender_id
+        JOIN users recipient ON recipient.id = m.recipient_id
+        WHERE
+          (m.sender_id = ? AND m.recipient_id = ?)
+          OR
+          (m.sender_id = ? AND m.recipient_id = ?)
+        ORDER BY datetime(m.created_at) ASC, m.id ASC
+        LIMIT 500
+      `
+    )
+    .all(userId, otherUserId, otherUserId, userId)
+}
+
+function broadcastTo(userId, payload) {
+  const userSockets = sockets.get(userId)
+
+  if (!userSockets) {
+    return
+  }
+
+  const encoded = JSON.stringify(payload)
+
+  for (const socket of userSockets) {
+    if (socket.readyState === socket.OPEN) {
+      socket.send(encoded)
+    }
+  }
+}
+
+app.post('/api/auth/register', (req, res) => {
+  const { username, password, publicKey, encryptedPrivateKey, keySalt } = req.body || {}
+  const validationError = validateAuthPayload(
+    { username, password, publicKey, encryptedPrivateKey, keySalt },
+    true
+  )
+
+  if (validationError) {
+    res.status(400).json({ error: validationError })
+    return
+  }
+
+  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username)
+  if (existing) {
+    res.status(409).json({ error: '用户名已存在' })
+    return
+  }
+
+  const salt = makeSalt()
+  const passwordHash = hashPassword(password, salt)
+
+  const result = db
+    .prepare(
+      `
+        INSERT INTO users (
+          username,
+          password_hash,
+          password_salt,
+          public_key,
+          encrypted_private_key,
+          key_salt
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `
+    )
+    .run(username, passwordHash, salt, publicKey, encryptedPrivateKey, keySalt)
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(result.lastInsertRowid)
+  const token = issueSession(user.id)
+  res.json({ token, user: publicUser(user) })
+})
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {}
+  const validationError = validateAuthPayload({ username, password }, false)
+
+  if (validationError) {
+    res.status(400).json({ error: validationError })
+    return
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username)
+  if (!user) {
+    res.status(404).json({ error: '用户不存在' })
+    return
+  }
+
+  const passwordHash = hashPassword(password, user.password_salt)
+  if (passwordHash !== user.password_hash) {
+    res.status(401).json({ error: '密码错误' })
+    return
+  }
+
+  const token = issueSession(user.id)
+  res.json({ token, user: publicUser(user) })
+})
+
+app.get('/api/contacts', authMiddleware, (req, res) => {
+  res.json({
+    contacts: listContacts(req.user.id),
+  })
+})
+
+app.post('/api/contacts', authMiddleware, (req, res) => {
+  const username = String(req.body?.username || '').trim()
+
+  if (!username) {
+    res.status(400).json({ error: '请输入联系人用户名' })
+    return
+  }
+
+  const contact = db.prepare('SELECT * FROM users WHERE username = ?').get(username)
+
+  if (!contact) {
+    res.status(404).json({ error: '联系人不存在' })
+    return
+  }
+
+  if (contact.id === req.user.id) {
+    res.status(400).json({ error: '不能添加自己为联系人' })
+    return
+  }
+
+  ensureMutualContact(req.user.id, contact.id)
+  broadcastTo(contact.id, { type: 'contact_refresh' })
+  res.json({ message: '联系人已添加', contact: { username: contact.username, publicKey: contact.public_key } })
+})
+
+app.get('/api/messages/:username', authMiddleware, (req, res) => {
+  const other = db.prepare('SELECT * FROM users WHERE username = ?').get(req.params.username)
+
+  if (!other) {
+    res.status(404).json({ error: '联系人不存在' })
+    return
+  }
+
+  ensureMutualContact(req.user.id, other.id)
+  markConversationRead(req.user.id, other.id)
+  res.json({
+    messages: conversationMessages(req.user.id, other.id),
+  })
+})
+
+app.post('/api/messages/:username/read', authMiddleware, (req, res) => {
+  const other = db.prepare('SELECT * FROM users WHERE username = ?').get(req.params.username)
+
+  if (!other) {
+    res.status(404).json({ error: '联系人不存在' })
+    return
+  }
+
+  ensureMutualContact(req.user.id, other.id)
+  const result = markConversationRead(req.user.id, other.id)
+  res.json({ updatedCount: result.changes })
+})
+
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist))
+
+  app.get(/^(?!\/api).*/, (req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'))
+  })
+}
+
+const server = app.listen(port, '0.0.0.0', () => {
+  console.log(`ShyTalk listening on http://0.0.0.0:${port}`)
+})
+
+const wss = new WebSocketServer({ server, path: '/ws' })
+
+wss.on('connection', (socket, req) => {
+  const origin = new URL(req.url, `http://${req.headers.host}`)
+  const token = origin.searchParams.get('token')
+  const session = token ? findSession(token) : null
+
+  if (!session) {
+    socket.send(JSON.stringify({ type: 'error', error: '连接未授权' }))
+    socket.close()
+    return
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(session.userId)
+
+  if (!user) {
+    socket.close()
+    return
+  }
+
+  const userSockets = sockets.get(user.id) || new Set()
+  userSockets.add(socket)
+  sockets.set(user.id, userSockets)
+
+  socket.on('message', (raw) => {
+    try {
+      const payload = JSON.parse(raw.toString())
+
+      if (payload.type !== 'send_message') {
+        socket.send(JSON.stringify({ type: 'error', error: '未知消息类型' }))
+        return
+      }
+
+      const recipientUsername = String(payload.recipientUsername || '').trim()
+      const kind = payload.kind === 'image' ? 'image' : 'text'
+      const bodyCipher = String(payload.bodyCipher || '')
+      const nonce = String(payload.nonce || '')
+
+      if (!recipientUsername || !bodyCipher || !nonce) {
+        socket.send(JSON.stringify({ type: 'error', error: '消息内容不完整' }))
+        return
+      }
+
+      const recipient = db.prepare('SELECT * FROM users WHERE username = ?').get(recipientUsername)
+
+      if (!recipient) {
+        socket.send(JSON.stringify({ type: 'error', error: '收件人不存在' }))
+        return
+      }
+
+      if (recipient.id === user.id) {
+        socket.send(JSON.stringify({ type: 'error', error: '不能给自己发送消息' }))
+        return
+      }
+
+      ensureMutualContact(user.id, recipient.id)
+
+      const result = db
+        .prepare(
+          `
+            INSERT INTO messages (sender_id, recipient_id, kind, body_cipher, nonce)
+            VALUES (?, ?, ?, ?, ?)
+          `
+        )
+        .run(user.id, recipient.id, kind, bodyCipher, nonce)
+
+      const message = db
+        .prepare(
+          `
+            SELECT
+              m.id,
+              m.kind,
+              m.body_cipher AS bodyCipher,
+              m.nonce,
+              m.created_at AS createdAt,
+              sender.username AS senderUsername,
+              recipient.username AS recipientUsername
+            FROM messages m
+            JOIN users sender ON sender.id = m.sender_id
+            JOIN users recipient ON recipient.id = m.recipient_id
+            WHERE m.id = ?
+          `
+        )
+        .get(result.lastInsertRowid)
+
+      const responsePayload = {
+        type: 'message_created',
+        message,
+      }
+
+      broadcastTo(user.id, responsePayload)
+      broadcastTo(recipient.id, responsePayload)
+    } catch (error) {
+      socket.send(JSON.stringify({ type: 'error', error: '消息处理失败' }))
+    }
+  })
+
+  socket.on('close', () => {
+    const userSocketsOnClose = sockets.get(user.id)
+
+    if (!userSocketsOnClose) {
+      return
+    }
+
+    userSocketsOnClose.delete(socket)
+
+    if (userSocketsOnClose.size === 0) {
+      sockets.delete(user.id)
+    }
+  })
+})
