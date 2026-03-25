@@ -6,6 +6,8 @@ import { decryptChatPayload, decryptPrivateKey, encryptChatPayload, generateIden
 const STORAGE_KEY = 'shytalk.credentials'
 const STORAGE_OPTIONS_KEY = 'shytalk.chat.options'
 const IMAGE_SIZE_LIMIT = 2 * 1024 * 1024
+const SOCKET_RECONNECT_MIN_DELAY = 1_000
+const SOCKET_RECONNECT_MAX_DELAY = 8_000
 const emojiPanel = ['😀', '😂', '🥹', '❤️', '👍', '🔥', '🎉', '🌙']
 const GENDER_OPTIONS = [
   { value: 'unknown', label: '保密' },
@@ -38,6 +40,8 @@ const mobileTabs = [
   { key: 'profile', label: '我的' },
 ]
 const installPromptEvent = ref(null)
+const socketReconnectTimer = ref(null)
+const socketReconnectAttempts = ref(0)
 
 const state = reactive({
   status: 'booting',
@@ -59,6 +63,7 @@ const state = reactive({
   clientCounter: 0,
   avatarOptions: [],
   savingProfile: false,
+  showComposerExtras: false,
 })
 
 const activeTitle = computed(() => state.activeContact?.username || '选择联系人')
@@ -242,12 +247,11 @@ function wsUrl(token) {
   return `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`
 }
 
-function storeCredentials(username, password) {
+function storeCredentials(username) {
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
       username,
-      password,
     })
   )
 }
@@ -342,7 +346,7 @@ async function openConversation(contact) {
   setNotice('')
 
   try {
-    const search = state.hideReadOnOpen ? '?hideRead=1' : ''
+    const search = state.hideReadOnOpen ? '?unconfirmedOnly=1' : ''
     const payload = await api.get(`/api/messages/${encodeURIComponent(contact.username)}${search}`, state.authToken)
     state.messages = payload.messages.map((message) => decodeMessage(message, contact))
     updateContactEntry(contact.username, { unreadCount: 0 })
@@ -428,7 +432,7 @@ async function finishAuth(sessionPayload, password, username) {
     sessionPayload.user.encryptedPrivateKey
   )
   syncProfileFormFromCurrentUser()
-  storeCredentials(username, password)
+  storeCredentials(username)
   state.status = 'ready'
   mobilePane.value = isMobile.value && !state.activeContact ? 'contacts' : 'chat'
   setNotice('已连接')
@@ -464,6 +468,47 @@ async function saveProfile() {
   } finally {
     state.savingProfile = false
   }
+}
+
+async function logout() {
+  const token = state.authToken
+  const rememberedUsername = state.currentUser?.username || authForm.username
+
+  clearSocketReconnectTimer()
+  state.socket?.close()
+  state.socket = null
+  state.socketState = 'offline'
+
+  if (token) {
+    try {
+      await api.post('/api/auth/logout', {}, token)
+    } catch {
+      // Ignore logout API failures and still clear local auth state.
+    }
+  }
+
+  if (rememberedUsername) {
+    storeCredentials(rememberedUsername)
+  }
+  contactForm.username = ''
+  authForm.password = ''
+  authForm.username = rememberedUsername || ''
+  authMode.value = 'login'
+
+  state.status = 'auth'
+  state.authToken = ''
+  state.currentUser = null
+  state.privateKey = null
+  state.contacts = []
+  state.activeContact = null
+  state.messages = []
+  state.draft = ''
+  state.previewImage = ''
+  state.loadingMessages = false
+  state.sendingImage = false
+  state.savingProfile = false
+  state.error = ''
+  state.info = ''
 }
 
 async function submitAuth() {
@@ -510,19 +555,16 @@ async function bootstrap() {
   try {
     const saved = loadCredentials()
 
-    if (!saved?.username || !saved?.password) {
-      state.status = 'auth'
-      authMode.value = 'login'
-      return
+    if (saved?.username) {
+      authForm.username = saved.username
     }
-
-    authForm.username = saved.username
-    authForm.password = saved.password
-    await submitAuth()
   } catch {
-    state.status = 'auth'
-    authMode.value = 'login'
+    // Ignore malformed local cache and continue with manual login.
   }
+
+  authForm.password = ''
+  state.status = 'auth'
+  authMode.value = 'login'
 }
 
 async function addContact() {
@@ -626,17 +668,41 @@ function connectSocket() {
     return
   }
 
+  clearSocketReconnectTimer()
   state.socket?.close()
   state.socketState = 'connecting'
   const socket = new WebSocket(wsUrl(state.authToken))
+  let downHandled = false
+
+  function handleSocketDown() {
+    if (downHandled) {
+      return
+    }
+
+    downHandled = true
+
+    if (state.socket === socket) {
+      state.socket = null
+    }
+
+    scheduleSocketReconnect()
+  }
 
   socket.addEventListener('open', () => {
+    clearSocketReconnectTimer()
+    socketReconnectAttempts.value = 0
     state.socketState = 'online'
     setNotice('实时连接已建立')
   })
 
   socket.addEventListener('message', (event) => {
-    const payload = JSON.parse(event.data)
+    let payload = null
+
+    try {
+      payload = JSON.parse(event.data)
+    } catch {
+      return
+    }
 
     if (payload.type === 'message_created') {
       appendIncomingMessage(payload.message, payload.clientId || '')
@@ -661,36 +727,74 @@ function connectSocket() {
   })
 
   socket.addEventListener('close', () => {
-    state.socketState = 'offline'
+    handleSocketDown()
   })
 
   socket.addEventListener('error', () => {
-    state.socketState = 'offline'
+    handleSocketDown()
   })
 
   state.socket = socket
 }
 
-function ensureSocketReady() {
-  if (!state.socket || state.socket.readyState !== WebSocket.OPEN) {
-    throw new Error('实时连接未就绪，请稍后重试')
+function clearSocketReconnectTimer() {
+  if (!socketReconnectTimer.value) {
+    return
   }
+
+  clearTimeout(socketReconnectTimer.value)
+  socketReconnectTimer.value = null
 }
 
-function sendCipherMessage(kind, encryptedPayload, clientId) {
-  ensureSocketReady()
-  state.socket.send(
-    JSON.stringify({
-      type: 'send_message',
-      recipientUsername: state.activeContact.username,
+function scheduleSocketReconnect() {
+  if (!state.authToken || state.status !== 'ready') {
+    state.socketState = 'offline'
+    return
+  }
+
+  clearSocketReconnectTimer()
+  const delay = Math.min(
+    SOCKET_RECONNECT_MAX_DELAY,
+    SOCKET_RECONNECT_MIN_DELAY * 2 ** socketReconnectAttempts.value
+  )
+  socketReconnectAttempts.value += 1
+  state.socketState = 'reconnecting'
+
+  socketReconnectTimer.value = window.setTimeout(() => {
+    connectSocket()
+  }, delay)
+}
+
+function markPendingMessageFailed(clientId) {
+  const pendingId = `pending:${clientId}`
+  const pending = state.messages.find((message) => message.id === pendingId)
+
+  if (!pending) {
+    return
+  }
+
+  pending.status = 'failed'
+}
+
+async function sendCipherMessage(kind, encryptedPayload, clientId) {
+  if (!state.activeContact) {
+    throw new Error('请先选择联系人')
+  }
+
+  const payload = await api.post(
+    `/api/messages/${encodeURIComponent(state.activeContact.username)}`,
+    {
       kind,
       clientId,
       ...encryptedPayload,
-    })
+    },
+    state.authToken
   )
+
+  appendIncomingMessage(payload.message, payload.clientId || clientId)
 }
 
-function sendDraft() {
+async function sendDraft() {
   const text = state.draft.trim()
 
   if (!text || !state.activeContact) {
@@ -711,15 +815,20 @@ function sendDraft() {
       state.privateKey
     )
 
-    sendCipherMessage('text', encryptedPayload, clientId)
+    await sendCipherMessage('text', encryptedPayload, clientId)
     state.draft = ''
   } catch (error) {
+    markPendingMessageFailed(clientId)
     setError(error.message)
   }
 }
 
 function appendEmoji(emoji) {
   state.draft += emoji
+}
+
+function toggleComposerExtras() {
+  state.showComposerExtras = !state.showComposerExtras
 }
 
 function selectImage() {
@@ -773,8 +882,9 @@ async function handleImageSelect(event) {
       state.privateKey
     )
 
-    sendCipherMessage('image', encryptedPayload, clientId)
+    await sendCipherMessage('image', encryptedPayload, clientId)
   } catch (error) {
+    markPendingMessageFailed(clientId)
     setError(error.message)
   } finally {
     state.sendingImage = false
@@ -812,7 +922,7 @@ onMounted(() => {
 
   bootstrap().catch(() => {
     state.status = 'auth'
-    setError('自动登录失败，请手动登录')
+    setError('初始化失败，请手动登录')
   })
 })
 
@@ -820,6 +930,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', syncViewportMode)
   window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   window.removeEventListener('appinstalled', onAppInstalled)
+  clearSocketReconnectTimer()
   state.socket?.close()
 })
 
@@ -859,9 +970,9 @@ watch(
 
     <section v-else-if="state.status === 'auth'" class="auth-card">
       <p class="eyebrow">ShyTalk</p>
-      <h1>{{ authMode === 'register' ? '创建你的聊天身份' : '输入用户名和密码登录' }}</h1>
+      <h1>{{ authMode === 'register' ? '创建你的聊天身份' : '登录' }}</h1>
       <p class="muted">
-        {{ authMode === 'register' ? '用户名将作为联系人添加时使用的账号名。' : '如果浏览器缓存还在，后续会自动登录。' }}
+        {{ authMode === 'register' ? '用户名将作为联系人添加时使用的账号名。' : '会记住登录名，但每次都需要输入密码。' }}
       </p>
 
       <form class="auth-form" @submit.prevent="submitAuth">
@@ -948,21 +1059,23 @@ watch(
       <section v-if="showChatPane" class="chat-panel" :class="{ 'mobile-pane': isMobile }">
         <header class="chat-header">
           <div class="chat-title-wrap">
+            <!--
             <button v-if="isMobile" type="button" class="back-button" @click="showContacts">通讯录</button>
-
+          -->
             <div>
               <p class="eyebrow">当前会话</p>
               <h2>{{ activeTitle }}</h2>
             </div>
           </div>
-
+          <!--
           <div class="chat-header-right">
             <label class="read-toggle">
               <input v-model="state.hideReadOnOpen" type="checkbox" />
-              <span>[] 自动清除</span>
+              <span>仅看未确认</span>
             </label>
             <p class="muted chat-header-note">{{ activeSubtitle }}</p>
           </div>
+        -->
         </header>
 
         <div v-if="!state.activeContact" class="chat-empty">
@@ -1002,7 +1115,10 @@ watch(
           </div>
 
           <div class="composer">
-            <div class="emoji-row">
+
+            <div v-if="state.showComposerExtras" class="composer-tools-row">
+             
+
               <button
                 v-for="emoji in emojiPanel"
                 :key="emoji"
@@ -1014,20 +1130,41 @@ watch(
               </button>
             </div>
 
-            <div class="composer-box">
-              <textarea
-                v-model="state.draft"
-                rows="2"
-                placeholder="输入文字，或者点上方表情。按 Enter 发送，Shift + Enter 换行。"
-                @keydown.enter.exact.prevent="sendDraft"
-              ></textarea>
+            <div class="composer-up">
+              <input ref="imagePicker" type="file" accept="image/*" hidden @change="handleImageSelect" />
+               <button
+                type="button"
+                class="ghost-button image-icon-button"
+                :title="state.sendingImage ? '图片发送中' : '发送图片'"
+                :aria-label="state.sendingImage ? '图片发送中' : '发送图片'"
+                @click="selectImage"
+              >
+                {{ state.sendingImage ? '...' : '🖼' }}
+              </button>
+              <button
+                    type="button"
+                    class="ghost-button toggle-tools-button"
+                    :title="state.showComposerExtras ? '收起工具栏' : '展开工具栏'"
+                    :aria-label="state.showComposerExtras ? '收起工具栏' : '展开工具栏'"
+                    @click="toggleComposerExtras"
+                  >
+                    {{ state.showComposerExtras ? '−' : '+' }}
+                  </button>
+            </div>
 
-              <div class="composer-actions">
-                <input ref="imagePicker" type="file" accept="image/*" hidden @change="handleImageSelect" />
-                <button type="button" class="ghost-button" @click="selectImage">
-                  {{ state.sendingImage ? '发送中…' : '图片' }}
-                </button>
-                <button type="button" class="primary-button" @click="sendDraft">发送</button>
+            <div class="composer-box">
+              <div class="composer-inline">
+                <textarea
+                  v-model="state.draft"
+                  rows="1"
+                  placeholder="输入文字，或者点上方表情。按 Enter 发送，Shift + Enter 换行。"
+                  @keydown.enter.exact.prevent="sendDraft"
+                ></textarea>
+
+                <div class="composer-actions">
+                
+                  <button type="button" class="primary-button send-pill-button" @click="sendDraft">发送</button>
+                </div>
               </div>
             </div>
           </div>
@@ -1124,6 +1261,13 @@ watch(
             <span>
               {{ state.activeContact ? '点底部“聊天”即可继续当前会话。' : '先去联系人页添加或选择一个联系人。' }}
             </span>
+          </article>
+
+          <article class="profile-card">
+            <p class="eyebrow">账号</p>
+            <strong>需要更换账号？</strong>
+            <button type="button" class="ghost-button logout-button" @click="logout">退出登录</button>
+            <span>退出后会清除会话状态并返回登录页，登录名会保留。</span>
           </article>
         </div>
       </section>

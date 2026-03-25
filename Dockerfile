@@ -16,5 +16,5 @@ COPY server/package.json ./server/package.json
 RUN npm install --omit=dev
 COPY --from=build /app/client/dist ./client/dist
 COPY server ./server
-EXPOSE 3000
+EXPOSE 4000
 CMD ["npm", "run", "start", "-w", "server"]

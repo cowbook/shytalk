@@ -35,7 +35,7 @@ npm run dev
 ```
 
 - 前端开发地址默认是 `http://localhost:5173`
-- 后端开发地址默认是 `http://localhost:3000`
+- 后端开发地址默认是 `http://localhost:4000`
 
 ## 构建
 
@@ -49,7 +49,7 @@ npm run build
 npm start
 ```
 
-默认监听 `3000` 端口，生产模式会直接把 `client/dist` 挂到首页 `/`。
+默认监听 `4000` 端口，生产模式会直接把 `client/dist` 挂到首页 `/`。
 
 ## 云服务器部署
 
@@ -60,7 +60,7 @@ npm start
 ```bash
 npm install
 npm run build
-PORT=3000 npm start
+PORT=4000 npm start
 ```
 
 建议：
@@ -73,7 +73,7 @@ PORT=3000 npm start
 
 ```bash
 docker build -t shytalk .
-docker run -d -p 3000:3000 -v $(pwd)/server/data:/app/server/data shytalk
+docker run -d -p 4000:4000 -v $(pwd)/server/data:/app/server/data shytalk
 ```
 
 ### 方式 3：一键脚本（Ubuntu + HTTPS 反代）
@@ -93,6 +93,40 @@ sudo bash deploy/quick-deploy.sh your.domain.com https://github.com/cowbook/shyt
 - 文件：`.github/workflows/ci.yml`
 - 触发：push 到 `main` 或 pull request
 - 任务：安装依赖并执行 `npm run build`
+
+## GitHub Webhook 自动强制更新
+
+服务端已提供接口：`POST /api/webhook`，用于在收到 GitHub `push` 事件后强制同步本地代码。
+
+### 1. 服务器环境变量
+
+建议在 systemd 或启动脚本中设置：
+
+- `WEBHOOK_REF`：监听分支，默认 `refs/heads/main`
+- `WEBHOOK_REMOTE`：远端名，默认 `origin`
+- `WEBHOOK_REPO_FULL_NAME`：可选，限制仓库，例如 `cowbook/shytalk`
+
+### 2. GitHub 仓库中配置 Webhook
+
+在仓库 `Settings -> Webhooks -> Add webhook` 中填写：
+
+- `Payload URL`: `https://talk.lng.cool/api/webhook`
+- `Content type`: `application/json`
+- `Secret`: 可留空（当前服务端不校验 secret）
+- `Which events`: 选择 `Just the push event`
+- 启用 `Active`
+
+### 3. webhook 执行行为
+
+当收到目标分支 push 时，服务器会在项目目录执行：
+
+```bash
+git fetch origin <branch>
+git reset --hard origin/<branch>
+git clean -fd
+```
+
+这会强制覆盖本地工作区，请不要在生产目录手工改代码。
 
 ## 安全边界
 

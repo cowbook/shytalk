@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -9,7 +10,11 @@ import { db } from './db.js'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const clientDist = path.resolve(__dirname, '../../client/dist')
-const port = Number(process.env.PORT || 3000)
+const repoRoot = path.resolve(__dirname, '../..')
+const port = Number(process.env.PORT || 4000)
+const webhookRef = process.env.WEBHOOK_REF || 'refs/heads/main'
+const webhookRemote = process.env.WEBHOOK_REMOTE || 'origin'
+const webhookRepoFullName = process.env.WEBHOOK_REPO_FULL_NAME || ''
 const sessions = new Map()
 const sockets = new Map()
 
@@ -30,6 +35,28 @@ const AVATAR_OPTIONS = [
 
 const app = express()
 app.use(express.json({ limit: '8mb' }))
+
+function forceUpdateRepositoryFromRemote() {
+  const branchName = webhookRef.replace(/^refs\/heads\//, '')
+
+  const fetchOutput = execFileSync('git', ['fetch', webhookRemote, branchName], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  })
+  const resetOutput = execFileSync('git', ['reset', '--hard', `${webhookRemote}/${branchName}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  })
+  const cleanOutput = execFileSync('git', ['clean', '-fd'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  })
+
+  return {
+    branch: branchName,
+    output: [fetchOutput, resetOutput, cleanOutput].filter(Boolean).join('\n').trim(),
+  }
+}
 
 function nowPlusDays(days) {
   return Date.now() + days * 24 * 60 * 60 * 1000
@@ -245,7 +272,7 @@ function listContacts(userId) {
 }
 
 function conversationMessages(userId, otherUserId, options = {}) {
-  const hideRead = Boolean(options.hideRead)
+  const unconfirmedOnly = Boolean(options.unconfirmedOnly)
 
   return db
     .prepare(
@@ -271,14 +298,80 @@ function conversationMessages(userId, otherUserId, options = {}) {
           AND
           (
             ? = 0
-            OR
-            NOT (m.recipient_id = ? AND m.read_at IS NOT NULL)
+            OR m.read_at IS NULL
           )
         ORDER BY datetime(m.created_at) ASC, m.id ASC
         LIMIT 500
       `
     )
-    .all(userId, otherUserId, otherUserId, userId, hideRead ? 1 : 0, userId)
+    .all(userId, otherUserId, otherUserId, userId, unconfirmedOnly ? 1 : 0)
+}
+
+function createMessage({ senderId, recipientUsername, kind, bodyCipher, nonce, clientId = '' }) {
+  const normalizedRecipientUsername = String(recipientUsername || '').trim()
+  const normalizedKind = kind === 'image' ? 'image' : 'text'
+  const normalizedBodyCipher = String(bodyCipher || '')
+  const normalizedNonce = String(nonce || '')
+  const normalizedClientId = String(clientId || '').trim()
+
+  if (!normalizedRecipientUsername || !normalizedBodyCipher || !normalizedNonce) {
+    return { error: '消息内容不完整', status: 400 }
+  }
+
+  const recipient = db.prepare('SELECT * FROM users WHERE username = ?').get(normalizedRecipientUsername)
+
+  if (!recipient) {
+    return { error: '收件人不存在', status: 404 }
+  }
+
+  if (recipient.id === senderId) {
+    return { error: '不能给自己发送消息', status: 400 }
+  }
+
+  ensureMutualContact(senderId, recipient.id)
+
+  const result = db
+    .prepare(
+      `
+        INSERT INTO messages (sender_id, recipient_id, kind, body_cipher, nonce)
+        VALUES (?, ?, ?, ?, ?)
+      `
+    )
+    .run(senderId, recipient.id, normalizedKind, normalizedBodyCipher, normalizedNonce)
+
+  const message = db
+    .prepare(
+      `
+        SELECT
+          m.id,
+          m.kind,
+          m.body_cipher AS bodyCipher,
+          m.nonce,
+          m.read_at AS readAt,
+          m.created_at AS createdAt,
+          sender.username AS senderUsername,
+          recipient.username AS recipientUsername
+        FROM messages m
+        JOIN users sender ON sender.id = m.sender_id
+        JOIN users recipient ON recipient.id = m.recipient_id
+        WHERE m.id = ?
+      `
+    )
+    .get(result.lastInsertRowid)
+
+  const responsePayload = {
+    type: 'message_created',
+    message,
+    clientId: normalizedClientId,
+  }
+
+  broadcastTo(senderId, responsePayload)
+  broadcastTo(recipient.id, responsePayload)
+
+  return {
+    message,
+    clientId: normalizedClientId,
+  }
 }
 
 function broadcastTo(userId, payload) {
@@ -378,6 +471,26 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ token, user: publicUser(user), avatarOptions: AVATAR_OPTIONS })
 })
 
+app.post('/api/auth/logout', authMiddleware, (req, res) => {
+  const token = parseBearerToken(req)
+
+  if (token) {
+    sessions.delete(token)
+  }
+
+  const userSockets = sockets.get(req.user.id)
+
+  if (userSockets) {
+    for (const socket of userSockets) {
+      socket.close()
+    }
+
+    sockets.delete(req.user.id)
+  }
+
+  res.json({ message: '已退出登录' })
+})
+
 app.get('/api/contacts', authMiddleware, (req, res) => {
   res.json({
     contacts: listContacts(req.user.id),
@@ -460,8 +573,8 @@ app.get('/api/messages/:username', authMiddleware, (req, res) => {
   }
 
   ensureMutualContact(req.user.id, other.id)
-  const hideRead = parseBooleanFlag(req.query.hideRead)
-  const messages = conversationMessages(req.user.id, other.id, { hideRead })
+  const unconfirmedOnly = parseBooleanFlag(req.query.unconfirmedOnly) || parseBooleanFlag(req.query.hideRead)
+  const messages = conversationMessages(req.user.id, other.id, { unconfirmedOnly })
   const result = markConversationRead(req.user.id, other.id)
 
   if (result.changes > 0) {
@@ -499,6 +612,77 @@ app.post('/api/messages/:username/read', authMiddleware, (req, res) => {
   }
 
   res.json({ updatedCount: result.changes })
+})
+
+app.post('/api/webhook', (req, res) => {
+  const event = String(req.headers['x-github-event'] || '')
+
+  if (event === 'ping') {
+    res.json({ ok: true, message: 'pong' })
+    return
+  }
+
+  if (event !== 'push') {
+    res.json({ ok: true, ignored: true, reason: '仅处理 push 事件' })
+    return
+  }
+
+  const payloadRef = String(req.body?.ref || '')
+
+  if (payloadRef !== webhookRef) {
+    res.json({ ok: true, ignored: true, reason: `仅处理 ${webhookRef}` })
+    return
+  }
+
+  if (webhookRepoFullName) {
+    const payloadRepo = String(req.body?.repository?.full_name || '')
+
+    if (payloadRepo !== webhookRepoFullName) {
+      res.json({ ok: true, ignored: true, reason: '仓库不匹配' })
+      return
+    }
+  }
+
+  try {
+    const result = forceUpdateRepositoryFromRemote()
+    res.json({
+      ok: true,
+      updated: true,
+      branch: result.branch,
+      output: result.output,
+    })
+  } catch (error) {
+    const stderr = typeof error?.stderr === 'string' ? error.stderr : ''
+    const stdout = typeof error?.stdout === 'string' ? error.stdout : ''
+
+    res.status(500).json({
+      error: '更新仓库失败',
+      detail: [stdout, stderr].filter(Boolean).join('\n').trim(),
+    })
+  }
+})
+
+app.post('/api/messages/:username', authMiddleware, (req, res) => {
+  const { kind, bodyCipher, nonce, clientId } = req.body || {}
+
+  const created = createMessage({
+    senderId: req.user.id,
+    recipientUsername: req.params.username,
+    kind,
+    bodyCipher,
+    nonce,
+    clientId,
+  })
+
+  if (created.error) {
+    res.status(created.status || 400).json({ error: created.error })
+    return
+  }
+
+  res.json({
+    message: created.message,
+    clientId: created.clientId,
+  })
 })
 
 if (fs.existsSync(clientDist)) {
@@ -546,68 +730,18 @@ wss.on('connection', (socket, req) => {
         return
       }
 
-      const recipientUsername = String(payload.recipientUsername || '').trim()
-      const kind = payload.kind === 'image' ? 'image' : 'text'
-      const bodyCipher = String(payload.bodyCipher || '')
-      const nonce = String(payload.nonce || '')
-      const clientId = String(payload.clientId || '').trim()
+      const created = createMessage({
+        senderId: user.id,
+        recipientUsername: payload.recipientUsername,
+        kind: payload.kind,
+        bodyCipher: payload.bodyCipher,
+        nonce: payload.nonce,
+        clientId: payload.clientId,
+      })
 
-      if (!recipientUsername || !bodyCipher || !nonce) {
-        socket.send(JSON.stringify({ type: 'error', error: '消息内容不完整' }))
-        return
+      if (created.error) {
+        socket.send(JSON.stringify({ type: 'error', error: created.error }))
       }
-
-      const recipient = db.prepare('SELECT * FROM users WHERE username = ?').get(recipientUsername)
-
-      if (!recipient) {
-        socket.send(JSON.stringify({ type: 'error', error: '收件人不存在' }))
-        return
-      }
-
-      if (recipient.id === user.id) {
-        socket.send(JSON.stringify({ type: 'error', error: '不能给自己发送消息' }))
-        return
-      }
-
-      ensureMutualContact(user.id, recipient.id)
-
-      const result = db
-        .prepare(
-          `
-            INSERT INTO messages (sender_id, recipient_id, kind, body_cipher, nonce)
-            VALUES (?, ?, ?, ?, ?)
-          `
-        )
-        .run(user.id, recipient.id, kind, bodyCipher, nonce)
-
-      const message = db
-        .prepare(
-          `
-            SELECT
-              m.id,
-              m.kind,
-              m.body_cipher AS bodyCipher,
-              m.nonce,
-              m.read_at AS readAt,
-              m.created_at AS createdAt,
-              sender.username AS senderUsername,
-              recipient.username AS recipientUsername
-            FROM messages m
-            JOIN users sender ON sender.id = m.sender_id
-            JOIN users recipient ON recipient.id = m.recipient_id
-            WHERE m.id = ?
-          `
-        )
-        .get(result.lastInsertRowid)
-
-      const responsePayload = {
-        type: 'message_created',
-        message,
-        clientId,
-      }
-
-      broadcastTo(user.id, responsePayload)
-      broadcastTo(recipient.id, responsePayload)
     } catch (error) {
       socket.send(JSON.stringify({ type: 'error', error: '消息处理失败' }))
     }

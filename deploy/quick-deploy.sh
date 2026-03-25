@@ -70,7 +70,7 @@ User=shytalk
 Group=shytalk
 WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
-Environment=PORT=3000
+Environment=PORT=4000
 ExecStart=/usr/bin/npm run start -w server
 Restart=always
 RestartSec=5
@@ -87,7 +87,7 @@ echo "[7/8] Configuring Caddy HTTPS reverse proxy..."
 cat > "$CADDY_FILE" <<EOF
 $DOMAIN {
   encode gzip
-  reverse_proxy 127.0.0.1:3000
+  reverse_proxy 127.0.0.1:4000
 }
 EOF
 
