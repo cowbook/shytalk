@@ -64,6 +64,7 @@ const state = reactive({
   avatarOptions: [],
   savingProfile: false,
   showComposerExtras: false,
+  isDraftFocused: false,
 })
 
 const activeTitle = computed(() => state.activeContact?.username || '选择联系人')
@@ -831,6 +832,14 @@ function toggleComposerExtras() {
   state.showComposerExtras = !state.showComposerExtras
 }
 
+function onDraftFocus() {
+  state.isDraftFocused = true
+}
+
+function onDraftBlur() {
+  state.isDraftFocused = false
+}
+
 function selectImage() {
   imagePicker.value?.click()
 }
@@ -1159,6 +1168,8 @@ watch(
                   rows="1"
                   placeholder="输入文字，或者点上方表情。按 Enter 发送，Shift + Enter 换行。"
                   @keydown.enter.exact.prevent="sendDraft"
+                  @focus="onDraftFocus"
+                  @blur="onDraftBlur"
                 ></textarea>
 
                 <div class="composer-actions">
@@ -1272,7 +1283,7 @@ watch(
         </div>
       </section>
 
-      <nav v-if="isMobile" class="mobile-tabbar" aria-label="手机导航">
+      <nav v-if="isMobile && !state.isDraftFocused" class="mobile-tabbar" aria-label="手机导航">
         <button
           v-for="tab in mobileTabs"
           :key="tab.key"

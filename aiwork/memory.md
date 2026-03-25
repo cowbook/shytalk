@@ -36,3 +36,6 @@
 - Pushed all above changes to GitHub `main`.
 	- Commit: `607537e`
 	- Message: `feat: update chat UX, auth flow, webhook, and default port`
+- Updated webhook deploy flow to non-blocking async mode: immediate GitHub response, then background pull/install/build and service self-restart.
+- Improved mobile chat UX: hide bottom tab bar while draft textarea is focused.
+- Fixed iOS keyboard focus layout issue by preventing horizontal overflow and avoiding focus zoom side effects in chat composer.
