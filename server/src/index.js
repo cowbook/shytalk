@@ -58,6 +58,43 @@ function forceUpdateRepositoryFromRemote() {
   }
 }
 
+let isDeploying = false
+
+function runBackgroundDeploy() {
+  if (isDeploying) {
+    console.log('[webhook] 已有部署任务在进行中，跳过')
+    return
+  }
+
+  isDeploying = true
+
+  try {
+    console.log('[webhook] 第 1 步：拉取最新代码...')
+    const updateResult = forceUpdateRepositoryFromRemote()
+    console.log(`[webhook] 代码更新成功 (${updateResult.branch})`)
+
+    console.log('[webhook] 第 2 步：安装依赖...')
+    execFileSync('npm', ['install'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    })
+    console.log('[webhook] 依赖安装完成')
+
+    console.log('[webhook] 第 3 步：编译前端...')
+    execFileSync('npm', ['run', 'build'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    })
+    console.log('[webhook] 前端编译完成，即将重启服务...')
+
+    // systemd Restart=always 会自动拉起新进程
+    process.exit(0)
+  } catch (error) {
+    isDeploying = false
+    console.error('[webhook] 后台部署失败:', error?.stderr || error?.message || error)
+  }
+}
+
 function nowPlusDays(days) {
   return Date.now() + days * 24 * 60 * 60 * 1000
 }
@@ -643,23 +680,11 @@ app.post('/api/webhook', (req, res) => {
     }
   }
 
-  try {
-    const result = forceUpdateRepositoryFromRemote()
-    res.json({
-      ok: true,
-      updated: true,
-      branch: result.branch,
-      output: result.output,
-    })
-  } catch (error) {
-    const stderr = typeof error?.stderr === 'string' ? error.stderr : ''
-    const stdout = typeof error?.stdout === 'string' ? error.stdout : ''
+  // 立即响应 GitHub，避免回调超时
+  res.json({ ok: true, accepted: true, message: '已接收 push 事件，后台部署已启动' })
 
-    res.status(500).json({
-      error: '更新仓库失败',
-      detail: [stdout, stderr].filter(Boolean).join('\n').trim(),
-    })
-  }
+  // 在响应刷出后异步执行部署（拉代码 → 装依赖 → 编译前端 → 重启）
+  setImmediate(runBackgroundDeploy)
 })
 
 app.post('/api/messages/:username', authMiddleware, (req, res) => {

@@ -22,3 +22,17 @@
 - Included avatar and nickname in user/contact payloads for frontend display.
 - Updated mobile UI to show avatars in sidebar and contact list.
 - Added profile editor with avatar picker, gender selector, nickname, and bio editing.
+- Changed default backend/deploy/runtime port from 3000 to 4000 across server, Vite proxy, Dockerfile, Caddy, deploy script, and README.
+- Added webhook endpoint `POST /api/webhook` to force-update local source on GitHub push (`git fetch` + `git reset --hard` + `git clean -fd`).
+- Adjusted webhook behavior to not require webhook secret verification; kept branch and optional repo name filters.
+- Refactored message sending path: added HTTP send endpoint `POST /api/messages/:username`, keeping WebSocket for realtime notifications/receipts.
+- Added WebSocket auto-reconnect with backoff and removed hard dependency on socket-ready for sending messages.
+- Changed conversation opening default to load only unconfirmed messages (`read_at IS NULL`) with `unconfirmedOnly=1`.
+- Updated auth behavior: disabled auto-login, only remembers username, manual password entry required every login.
+- Added logout flow end-to-end: backend `/api/auth/logout` + frontend logout button in profile page and local/session cleanup.
+- Updated chat composer UX to compact inline layout, right-aligned actions, pill-shaped send button, and icon-style image trigger.
+- Added expandable composer tools: default hidden; circular toggle button reveals emoji row with image button on upper line.
+- Synced major UI theme updates to pink palette and refined compact form controls.
+- Pushed all above changes to GitHub `main`.
+	- Commit: `607537e`
+	- Message: `feat: update chat UX, auth flow, webhook, and default port`
